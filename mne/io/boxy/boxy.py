@@ -4,19 +4,17 @@
 
 import glob as glob
 import re as re
-import os
 
 import numpy as np
 
 from ..base import BaseRaw
 from ..meas_info import create_info
-from ...transforms import apply_trans, get_ras_to_neuromag_trans
 from ...utils import logger, verbose, fill_doc
-from ...channels.montage import make_dig_montage
 
 
 @fill_doc
-def read_raw_boxy(fname, datatype='AC', preload=False, verbose=None):
+def read_raw_boxy(fname, datatype='AC', multi_file=False,
+                  preload=False, verbose=None):
     """Reader for a BOXY optical imaging recording.
 
     Parameters
@@ -25,6 +23,12 @@ def read_raw_boxy(fname, datatype='AC', preload=False, verbose=None):
         Path to the BOXY data folder.
     datatype : str
         Type of data to return (AC, DC, or Ph).
+    multi_file : bool
+        If True, load multiple boxy files per participant. Expects files to be
+        named a specific way, specifying block and montage. For example:
+        1anc071a.001 = Montage A, Block 1; 1anc071b.002 = Montage B, Block 2
+        If False, only load a single boxy file per participant. Name does not
+        matter in this case, but file extension should be .txt.
     %(preload)s
     %(verbose)s
 
@@ -37,7 +41,7 @@ def read_raw_boxy(fname, datatype='AC', preload=False, verbose=None):
     --------
     mne.io.Raw : Documentation of attribute and methods.
     """
-    return RawBOXY(fname, datatype, preload, verbose)
+    return RawBOXY(fname, datatype, multi_file, preload, verbose)
 
 
 @fill_doc
@@ -50,6 +54,12 @@ class RawBOXY(BaseRaw):
         Path to the BOXY data folder.
     datatype : str
         Type of data to return (AC, DC, or Ph).
+    multi_file : bool
+        If True, load multiple boxy files per participant. Expects files to be
+        named a specific way, specifying block and montage. For example:
+        1anc071a.001 = Montage A, Block 1; 1anc071b.002 = Montage B, Block 2
+        If False, only load a single boxy file per participant. Name does not
+        matter in this case, but file extension should be .txt.
     %(preload)s
     %(verbose)s
 
@@ -59,24 +69,25 @@ class RawBOXY(BaseRaw):
     """
 
     @verbose
-    def __init__(self, fname, datatype='AC', preload=False, verbose=None):
+    def __init__(self, fname, datatype='AC', multi_file=False, preload=False,
+                 verbose=None):
         logger.info('Loading %s' % fname)
 
         # Check if required files exist and store names for later use.
         files = dict()
-        keys = ('mtg', 'elp', '*.[000-999]*')
+        if multi_file:
+            key = '*.[000-999]*'
+        else:
+            key = '*.txt'
         print(fname)
-        for key in keys:
-            if key == '*.[000-999]*':
-                files[key] = [glob.glob('%s/*%s' % (fname, key))]
-                # make sure filenames are in order
-                files[key][0].sort()
-            else:
-                files[key] = glob.glob('%s/*%s' % (fname, key))
-            if len(files[key]) != 1:
-                raise RuntimeError('Expect one %s file, got %d' %
-                                   (key, len(files[key]),))
-            files[key] = files[key][0]
+        files[key] = [glob.glob('%s/*%s' % (fname, key))]
+
+        # Make sure filenames are in order.
+        files[key][0].sort()
+        if len(files[key]) != 1:
+            raise RuntimeError('Expect one %s file, got %d' %
+                               (key, len(files[key]),))
+        files[key] = files[key][0]
 
         # Determine which data type to return.
         if datatype in ['AC', 'DC', 'Ph']:
@@ -84,16 +95,22 @@ class RawBOXY(BaseRaw):
         else:
             raise RuntimeError('Expect AC, DC, or Ph, got %s' % datatype)
 
-        # Determine how many blocks we have per montage.
-        blk_names = list()
-        mtg_names = list()
-        mtgs = re.findall(r'\w\.\d+', str(files['*.[000-999]*']))
-        [mtg_names.append(i_mtg[0]) for i_mtg in mtgs
-            if i_mtg[0] not in mtg_names]
-        for i_mtg in mtg_names:
-            temp = list()
-            [temp.append(ii_mtg[2:]) for ii_mtg in mtgs if ii_mtg[0] == i_mtg]
-            blk_names.append(temp)
+        # If loading multiple files per participant,
+        # determine how many blocks we have per montage.
+        if multi_file:
+            blk_names = list()
+            mtg_names = list()
+            mtgs = re.findall(r'\w\.\d+', str(files['*.[000-999]*']))
+            [mtg_names.append(i_mtg[0]) for i_mtg in mtgs
+                if i_mtg[0] not in mtg_names]
+            for i_mtg in mtg_names:
+                temp = list()
+                [temp.append(ii_mtg[2:]) for ii_mtg in mtgs
+                 if ii_mtg[0] == i_mtg]
+                blk_names.append(temp)
+        else:
+            blk_names = [['001']]
+            mtg_names = ['a']
 
         # Read header file and grab some info.
         detect_num = list()
@@ -103,8 +120,8 @@ class RawBOXY(BaseRaw):
         srate = list()
         start_line = list()
         end_line = list()
-        filetype = ['parsed' for i_file in files['*.[000-999]*']]
-        for file_num, i_file in enumerate(files['*.[000-999]*'], 0):
+        filetype = ['parsed' for i_file in files[key]]
+        for file_num, i_file in enumerate(files[key], 0):
             with open(i_file, 'r') as data:
                 for line_num, i_line in enumerate(data, 1):
                     if '#DATA ENDS' in i_line:
@@ -129,161 +146,17 @@ class RawBOXY(BaseRaw):
                     elif 'exmux' in i_line:
                         filetype[file_num] = 'non-parsed'
 
-        # Extract source-detectors.
-        chan_num_1 = list()
-        chan_num_2 = list()
-        source_label = list()
-        detect_label = list()
-        chan_wavelength = list()
-        chan_modulation = list()
-
-        # Load and read each line of the .mtg file.
-        with open(files['mtg'], 'r') as data:
-            for line_num, i_line in enumerate(data, 1):
-                if line_num == 2:
-                    mtg_chan_num = [int(num) for num in i_line.split()]
-                elif line_num > 2:
-                    (chan1, chan2, source, detector,
-                     wavelength, modulation) = i_line.split()
-                    chan_num_1.append(chan1)
-                    chan_num_2.append(chan2)
-                    source_label.append(source)
-                    detect_label.append(detector)
-                    chan_wavelength.append(wavelength)
-                    chan_modulation.append(modulation)
-
-        # Read information about probe/montage/optodes.
-        # A word on terminology used here:
-        # Sources produce light
-        # Detectors measure light
-        # Sources and detectors are both called optodes
-        # Each source - detector pair produces a channel
-        # Channels are defined as the midpoint between source and detector
-
-        # Load and read .elp file.
-        all_labels = list()
-        all_coords = list()
-        fiducial_coords = list()
-        get_label = 0
-        get_coords = 0
-
-        with open(files['elp'], 'r') as data:
-            for i_line in data:
-                # First let's get our fiducial coordinates.
-                if '%F' in i_line:
-                    fiducial_coords.append(i_line.split()[1:])
-                # Check where sensor info starts.
-                if '//Sensor name' in i_line:
-                    get_label = 1
-                elif get_label == 1:
-                    # Grab the part after '%N' for the label.
-                    label = i_line.split()[1]
-                    all_labels.append(label)
-                    get_label = 0
-                    get_coords = 1
-                elif get_coords == 1:
-                    X, Y, Z = i_line.split()
-                    all_coords.append([float(X), float(Y), float(Z)])
-                    get_coords = 0
-        for i_index in range(3):
-            fiducial_coords[i_index] = np.asarray([float(x)
-                                                  for x in
-                                                  fiducial_coords[i_index]])
-
-        # Get coordinates from .elp file, for sources in .mtg file.
-        source_coords = list()
-        for i_chan in source_label:
-            if i_chan in all_labels:
-                chan_index = all_labels.index(i_chan)
-                source_coords.append(all_coords[chan_index])
-
-        # get coordinates from .elp file, for detectors in .mtg file.
-        detect_coords = list()
-        for i_chan in detect_label:
-            if i_chan in all_labels:
-                chan_index = all_labels.index(i_chan)
-                detect_coords.append(all_coords[chan_index])
-
-        # Generate meaningful channel names for each montage.
-        unique_source_labels = list()
-        unique_detect_labels = list()
-        for mtg_num, i_mtg in enumerate(mtg_chan_num, 0):
-            start = int(np.sum(mtg_chan_num[:mtg_num]))
-            end = int(np.sum(mtg_chan_num[:mtg_num + 1]))
-            [unique_source_labels.append(label)
-                for label in source_label[start:end]
-                if label not in unique_source_labels]
-            [unique_detect_labels.append(label)
-                for label in detect_label[start:end]
-                if label not in unique_detect_labels]
-
-        # Swap order to have lower wavelength first.
-        for i_chan in range(0, len(chan_wavelength), 2):
-            chan_wavelength[i_chan], chan_wavelength[i_chan + 1] = (
-                chan_wavelength[i_chan + 1], chan_wavelength[i_chan])
-
         # Label each channel in our data.
         # Data is organised by channels x timepoint, where the first
         # 'source_num' rows correspond to the first detector, the next
         # 'source_num' rows correspond to the second detector, and so on.
-        boxy_coords = list()
         boxy_labels = list()
-        mrk_coords = list()
-        mrk_labels = list()
-        mtg_start = list()
-        mtg_end = list()
-        mtg_src_num = list()
-        mtg_det_num = list()
-        mtg_mdf = list()
-        blk_num = [len(blk) for blk in blk_names]
-        for mtg_num, i_mtg in enumerate(mtg_chan_num, 0):
-            start = int(np.sum(mtg_chan_num[:mtg_num]))
-            end = int(np.sum(mtg_chan_num[:mtg_num + 1]))
-            # Organise some data for each montage.
-            start_blk = int(np.sum(blk_num[:mtg_num]))
-            # Get stop and stop lines for each montage.
-            mtg_start.append(start_line[start_blk])
-            mtg_end.append(end_line[start_blk])
-            # Get source and detector numbers for each montage.
-            mtg_src_num.append(source_num[start_blk])
-            mtg_det_num.append(detect_num[start_blk])
-            # Get modulation frequency for each channel and montage.
-            # Assuming modulation freq in MHz.
-            mtg_mdf.append([int(chan_mdf) * 1e6 for chan_mdf
-                            in chan_modulation[start:end]])
-            for i_type in data_types:
-                for i_coord in range(start, end):
-                    boxy_coords.append(
-                        np.mean(np.vstack((source_coords[i_coord],
-                                           detect_coords[i_coord])),
-                                axis=0).tolist() + source_coords[i_coord] +
-                        detect_coords[i_coord] + [chan_wavelength[i_coord]] +
-                        [0] + [0])
-                    boxy_labels.append('S' + str(unique_source_labels.index(
-                        source_label[i_coord]) + 1) + '_D' +
-                        str(unique_detect_labels.index(detect_label[i_coord]) +
-                            1) + ' ' + chan_wavelength[i_coord])
-
-                # Add extra column for triggers.
-                mrk_labels.append('Markers' + ' ' + mtg_names[mtg_num])
-                mrk_coords.append(np.zeros((12,)))
-
-        # Add triggers to the end of our data.
-        boxy_labels.extend(mrk_labels)
-        boxy_coords.extend(mrk_coords)
-
-        # Convert to floats.
-        boxy_coords = np.array(boxy_coords, float)
-        all_coords = np.array(all_coords, float)
-
-        # Montage wants channel coords and labels as a dict.
-        all_chan_dict = dict(zip(all_labels, all_coords))
-
-        my_dig_montage = make_dig_montage(ch_pos=all_chan_dict,
-                                          coord_frame='unknown',
-                                          nasion=fiducial_coords[0],
-                                          lpa=fiducial_coords[1],
-                                          rpa=fiducial_coords[2])
+        for mtg_num, i_mtg in enumerate(mtg_names, 0):
+            for det_num in range(detect_num[::len(blk_names[0])][mtg_num]):
+                for src_num in range(source_num[::len(blk_names[0])][mtg_num]):
+                    boxy_labels.append('S' + str(src_num + 1) +
+                                       '_D' + str(det_num + 1) +
+                                       '_' + str(mtg_num + 1))
 
         # Determine channel types.
         if datatype == 'Ph':
@@ -291,49 +164,20 @@ class RawBOXY(BaseRaw):
         else:
             chan_type = 'fnirs_cw_amplitude'
 
-        ch_types = ([chan_type if i_chan < np.sum(mtg_chan_num) else 'stim'
-                     for i_chan, _ in enumerate(boxy_labels)])
+        ch_types = ([chan_type for i_chan in boxy_labels])
 
         # Create info structure.
         info = create_info(boxy_labels, srate[0], ch_types=ch_types)
-
-        # Add montage to info.
-        info.set_montage(my_dig_montage)
-
-        # Store channel, source, and detector locations.
-        # The channel location is stored in the first 3 entries of loc.
-        # The source location is stored in the second 3 entries of loc.
-        # The detector location is stored in the third 3 entries of loc.
-        # Also encode the light frequency in the structure.
-        native_head_t = get_ras_to_neuromag_trans(fiducial_coords[0],
-                                                  fiducial_coords[1],
-                                                  fiducial_coords[2])
-
-        # These are all in actual 3d individual coordinates,
-        # so let's transform them to the Neuromag head coordinate frame.
-        for i_chan in range(len(boxy_labels)):
-            if i_chan < np.sum(mtg_chan_num):
-                temp_ch_src_det = apply_trans(
-                    native_head_t,
-                    boxy_coords[i_chan][:9].reshape(3, 3)).ravel()
-            else:
-                # Don't want to transform markers.
-                temp_ch_src_det = np.zeros(9,)
-            # Add wavelength and placeholders.
-            temp_other = np.asarray(boxy_coords[i_chan][9:], dtype=np.float64)
-            info['chs'][i_chan]['loc'] = np.concatenate((temp_ch_src_det,
-                                                        temp_other), axis=0)
 
         raw_extras = {'source_num': source_num,
                       'detect_num': detect_num,
                       'start_line': start_line,
                       'end_line': end_line,
                       'filetype': filetype,
-                      'files': files,
+                      'files': files[key],
                       'montages': mtg_names,
                       'blocks': blk_names,
                       'data_types': data_types,
-                      'mtg_mdf': mtg_mdf,
                       }
 
         # Check data start lines.
@@ -388,8 +232,6 @@ class RawBOXY(BaseRaw):
         Regardless of type, output has (n_montages x n_sources x n_detectors
         + n_marker_channels) rows, and (n_timepoints x n_blocks) columns.
         """
-        import scipy.io as spio
-
         source_num = self._raw_extras[fi]['source_num']
         detect_num = self._raw_extras[fi]['detect_num']
         start_line = self._raw_extras[fi]['start_line']
@@ -398,32 +240,7 @@ class RawBOXY(BaseRaw):
         data_types = self._raw_extras[fi]['data_types']
         montages = self._raw_extras[fi]['montages']
         blocks = self._raw_extras[fi]['blocks']
-        mtg_mdf = self._raw_extras[fi]['mtg_mdf']
-        boxy_files = self._raw_extras[fi]['files']['*.[000-999]*']
-        event_fname = os.path.join(self._filenames[fi], 'evt')
-
-        # Check if event files are available.
-        # Mostly for older boxy files since we'll be using the digaux channel
-        # for markers in further recordings.
-        try:
-            event_files = dict()
-            key = ('*.[000-999]*')
-            print(event_fname)
-            event_files[key] = [glob.glob('%s/*%s' % (event_fname, key))]
-            event_files[key] = event_files[key][0]
-            event_data = list()
-
-            for file_num, i_file in enumerate(event_files[key]):
-                event_data.append(spio.loadmat(
-                    event_files[key][file_num])['event'])
-            if event_data != list():
-                print('Event file found!')
-            else:
-                print('No event file found. Using digaux!')
-
-        except Exception:
-            print('No event file found. Using digaux!')
-            pass
+        boxy_files = self._raw_extras[fi]['files']
 
         # Possible detector names.
         detectors = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K',
@@ -432,12 +249,10 @@ class RawBOXY(BaseRaw):
 
         # Load our optical data.
         all_data = list()
-        all_markers = list()
 
         # Loop through montages.
         for i_mtg, mtg_name in enumerate(montages):
             all_blocks = list()
-            block_markers = list()
 
             # Loop through blocks.
             for i_blk, blk_name in enumerate(blocks[i_mtg]):
@@ -552,121 +367,11 @@ class RawBOXY(BaseRaw):
                                 # Save our data based on data type.
                                 data_[index_loc, :] = boxy_array[:, channel]
 
-                    # Phase unwrapping.
-                    if i_data == 'Ph':
-                        print('Fixing phase wrap')
-                        # Accounts for sharp, sudden changes in phase
-                        # such as crossing over from 0/360 degrees.
-                        # Estimate mean phase of first 50 points.
-                        # If a point differs more than 90 degrees from the
-                        # mean, add or subtract 360 degrees from that point.
-                        for i_chan in range(np.size(data_, axis=0)):
-                            if np.mean(data_[i_chan, :50]) < 180:
-                                wrapped_points = data_[i_chan, :] > 270
-                                data_[i_chan, wrapped_points] -= 360
-                            else:
-                                wrapped_points = data_[i_chan, :] < 90
-                                data_[i_chan, wrapped_points] += 360
-
-                        print('Detrending phase data')
-                        # Remove trends and drifts that occur over time.
-                        y = np.linspace(0, np.size(data_, axis=1) - 1,
-                                        np.size(data_, axis=1))
-                        x = np.transpose(y)
-                        for i_chan in range(np.size(data_, axis=0)):
-                            poly_coeffs = np.polyfit(x, data_[i_chan, :], 3)
-                            tmp_ph = (data_[i_chan, :] -
-                                      np.polyval(poly_coeffs, x))
-                            data_[i_chan, :] = tmp_ph
-
-                        print('Removing phase mean')
-                        # Subtract mean to better detect outliers using SD.
-                        mrph = np.mean(data_, axis=1)
-                        for i_chan in range(np.size(data_, axis=0)):
-                            data_[i_chan, :] = (data_[i_chan, :] -
-                                                mrph[i_chan])
-
-                        print('Removing phase outliers')
-                        # Remove data points that are larger than three SDs.
-                        ph_out_thr = 3
-
-                        # Set ddof to 1 to mimic matlab.
-                        sdph = np.std(data_, 1, ddof=1)
-                        n_ph_out = np.zeros(np.size(data_, axis=0),
-                                            dtype=np.int8)
-
-                        for i_chan in range(np.size(data_, axis=0)):
-                            outliers = np.where(np.abs(data_[i_chan, :]) >
-                                                (ph_out_thr * sdph[i_chan]))
-                            outliers = outliers[0]
-                            if len(outliers) > 0:
-                                if outliers[0] == 0:
-                                    outliers = outliers[1:]
-                                if len(outliers) > 0:
-                                    if (outliers[-1] == np.size(data_,
-                                                                axis=1) - 1):
-                                        outliers = outliers[:-1]
-                                    n_ph_out[i_chan] = int(len(outliers))
-                                    for i_pt in range(n_ph_out[i_chan]):
-                                        j_pt = outliers[i_pt]
-                                        data_[i_chan, j_pt] = (
-                                            (data_[i_chan, j_pt - 1] +
-                                             data_[i_chan, j_pt + 1]) / 2)
-
-                        # Convert phase to pico seconds.
-                        for i_chan in range(np.size(data_, axis=0)):
-                            data_[i_chan, :] = ((1e12 * data_[i_chan, :]) /
-                                                (360 * mtg_mdf[i_mtg][i_chan]))
-
-                # Swap channels to match new wavelength order.
-                for i_chan in range(0, len(data_), 2):
-                    data_[[i_chan, i_chan + 1]] = data_[[i_chan + 1, i_chan]]
-
-                # If there was an event file, place those events in our data.
-                # If no, use digaux for our events.
-                try:
-                    temp_markers = np.zeros((len(data_[0, :]),))
-                    for event_num, event_info in enumerate(
-                            event_data[file_num]):
-                        temp_markers[event_info[0] - 1] = event_info[1]
-                    block_markers.append(temp_markers)
-                except Exception:
-
-                    # Add our markers to the data array based on filetype.
-                    if type(meta_data['digaux']) is not list:
-                        if filetype[file_num] == 'non-parsed':
-                            block_markers.append(
-                                meta_data['digaux']
-                                [np.arange(0, len(meta_data['digaux']),
-                                           source_num[file_num])])
-                        elif filetype[file_num] == 'parsed':
-                            block_markers.append(meta_data['digaux'])
-                    else:
-                        block_markers.append(np.zeros((len(data_[0, :]),)))
-
-                # Check our markers to see if anything is actually in there.
-                if (all(i_mrk == 0 for i_mrk in block_markers[i_blk]) or
-                        all(i_mrk == 255 for i_mrk in block_markers[i_blk])):
-                    print('No markers for montage ' + mtg_name +
-                          ' and block ' + blk_name)
-                else:
-                    print('Found markers for montage ' + mtg_name +
-                          ' and block ' + blk_name + '!')
-
-                # Change marker for last timepoint to indicate end of block
-                # We'll be using digaux to send markers, a serial port,
-                # so we can send values between 1-255.
-                # We'll multiply our block start/end markers by 1000 to ensure
-                # we aren't within the 1-255 range.
-                block_markers[i_blk][-1] = int(blk_name) * 1000
-
                 all_blocks.append(data_)
 
             all_data.extend(np.hstack(all_blocks))
-            all_markers.append(np.hstack(block_markers))
 
-        # Add markers to our data.
-        all_data.extend(all_markers)
+        # Change data to array.
         all_data = np.asarray(all_data)
 
         print('Blank Data shape: ', data.shape)

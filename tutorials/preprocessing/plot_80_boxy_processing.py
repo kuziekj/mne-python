@@ -29,7 +29,7 @@ boxy_data_folder = mne.datasets.boxy_example.data_path()
 boxy_raw_dir = os.path.join(boxy_data_folder, 'Participant-1')
 
 # Load AC and Phase data
-raw_intensity_ac = mne.io.read_raw_boxy(boxy_raw_dir, 'AC',
+raw_intensity_ac = mne.io.read_raw_boxy(boxy_raw_dir, 'AC', multi_file=True,
                                         verbose=True).load_data()
 
 # Plot the raw data
